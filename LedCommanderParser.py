@@ -8,7 +8,7 @@ from typing import BinaryIO, Tuple, List, Optional
 
 # File info so far
 # 0x00000 - 0x00009  "succeeded", magic number
-# 0x00200 - 0x0029F  Block of FF \
+# 0x00200 - 0x0029F  Block of FF \  # first 16 blocks are scenes, rest will most likely be chaser steps
 # 0x002A0 - 0x002B7  Block of 00 /  Repeating until 0x5AAFF
 # 0x5AB00 - 0x5AB53  Names of Channels / Pan / Tilt / Aux
 # 0x5AB54 - 0x5AD53  DMX Channel assignment
@@ -22,11 +22,53 @@ from typing import BinaryIO, Tuple, List, Optional
 # 0x6AA3D - 0x801FF  Block of FF, probably not used
 
 
+class Scene:
+    def __init__(self):
+        self.fixture_channel_values: List[List[int]] = []
+        self.fixture_channel_active: List[List[bool]] = []
+        for fixture_id in range(LedCommanderParser.FIXTURES_COUNT):
+            self.fixture_channel_values.append([0] * LedCommanderParser.CHANNELS_COUNT)
+            self.fixture_channel_active.append([False] * LedCommanderParser.CHANNELS_COUNT)
+        self.mystery_flags = b"" * 4
+
+    def is_set(self):
+        return any(fixture != [255] * LedCommanderParser.CHANNELS_COUNT for fixture in self.fixture_channel_values)
+
+    def print(self):
+        for fixture_id in range(LedCommanderParser.FIXTURES_COUNT):
+            values = '|'.join('%02x' % self.fixture_channel_values[fixture_id][channel_id]
+                              if self.fixture_channel_active[fixture_id][channel_id] else '  '
+                              for channel_id in range(LedCommanderParser.CHANNELS_COUNT))
+            info(f" Fixture {fixture_id + 1:02d}: [{values}]")
+
+        info(f"Mystery: {self.mystery_flags.hex()}")
+
+    @classmethod
+    def parse_from(cls, readfile: BinaryIO, *args, **kwargs) -> "Scene":
+        self = cls(*args, **kwargs)
+        for fixture_id in range(LedCommanderParser.FIXTURES_COUNT):
+            self.fixture_channel_values[fixture_id] = [value for value in readfile.read(LedCommanderParser.CHANNELS_COUNT)]
+
+        index = 0
+        for byte in readfile.read(20):
+            for bit_id in range(8):
+                value = byte & (1 << bit_id) != 0
+                fixture, channel = divmod(index, LedCommanderParser.CHANNELS_COUNT)
+                self.fixture_channel_active[fixture][channel] = value
+                index += 1
+
+        self.mystery_flags = readfile.read(4)  # Will likely contain chase information / flag for channels?
+
+        return self
+
+
 class LedCommanderParser:
     FIXTURES_COUNT: int = 16
     CHANNELS_COUNT: int = 10
     CHANNELS_NAMES_COUNT: int = 12
     DMX_CHANNELS_COUNT: int = 512
+    STATIC_SCENES_COUNT: int = 16
+    CHASER_SCENES_COUNT: int = 2000
 
     def __init__(self, file):
         self.channel_names = [b"unknown"] * self.CHANNELS_NAMES_COUNT
@@ -34,6 +76,7 @@ class LedCommanderParser:
         self.dmx_assignments: List[Optional[Tuple[Optional[int], int]]] = [None] * self.DMX_CHANNELS_COUNT
         self.virtual_dimmer_modes: List[int] = [0] * self.FIXTURES_COUNT
         self.virtual_dimmer_assignments: List[List[int]] = [[0] * self.CHANNELS_COUNT] * self.FIXTURES_COUNT
+        self.static_scenes: List[Scene] = [Scene()] * self.STATIC_SCENES_COUNT
 
         with open(file, "rb") as readfile:
             self.is_magic_number_ok = self._read_and_check_magic_number(readfile)
@@ -42,7 +85,7 @@ class LedCommanderParser:
                 return
             info(f"Magic number ok")
 
-            self._read_mystery_blocks(readfile)
+            self._read_scenes(readfile)
             self._read_names(readfile)
             self._read_dmx_channel_assignments(readfile)
             self._read_mystery_fixture_info(readfile)
@@ -94,7 +137,7 @@ class LedCommanderParser:
         return magic_number == b"succeeded" + (b"\x00" * 503)
 
     @staticmethod
-    def _read_mystery_block(readfile: BinaryIO) -> bytes:
+    def _read_scene(readfile: BinaryIO) -> Scene:
         """
         Read block that contain information about scenes and chaser steps.
 
@@ -104,12 +147,10 @@ class LedCommanderParser:
         :param readfile: file to read bytes from.
         :return read block
         """
-        _guess_payload = readfile.read(160)  # looks like FIXTURES_COUNT * CHANNEL_COUNT to me
-        _guess_flags = readfile.read(24)
-        # TODO: not sure how to interpret these
-        return _guess_payload + _guess_flags
+        scene = Scene.parse_from(readfile)
+        return scene
 
-    def _read_mystery_blocks(self, readfile: BinaryIO) -> None:
+    def _read_scenes(self, readfile: BinaryIO) -> None:
         """
         Read blocks that contain information about scenes and chaser steps.
 
@@ -119,8 +160,15 @@ class LedCommanderParser:
 
         :param readfile: file to read bytes from.
         """
-        for block_id in range(2016):  # 16 scenes + 2000 chaser steps
-            self._read_mystery_block(readfile)
+        for static_scene_id in range(self.STATIC_SCENES_COUNT):
+            scene = self._read_scene(readfile)
+            if scene.is_set():
+                info(f"Scene {static_scene_id + 1}:")
+                scene.print()
+            self.static_scenes[static_scene_id] = scene
+
+        for block_id in range(self.CHASER_SCENES_COUNT):
+            self._read_scene(readfile)
 
     @staticmethod
     def _read_name(readfile: BinaryIO) -> bytes:

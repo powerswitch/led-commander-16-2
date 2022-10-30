@@ -75,7 +75,9 @@ class LedCommanderParser:
         self.default_channel_names = self._create_default_channel_names()
         self.dmx_assignments: List[Optional[Tuple[Optional[int], int]]] = [None] * self.DMX_CHANNELS_COUNT
         self.virtual_dimmer_modes: List[int] = [0] * self.FIXTURES_COUNT
-        self.virtual_dimmer_assignments: List[List[int]] = [[0] * self.CHANNELS_COUNT] * self.FIXTURES_COUNT
+        self.virtual_dimmer_assignments: List[List[int]] = []
+        for fixture_id in range(LedCommanderParser.FIXTURES_COUNT):
+            self.virtual_dimmer_assignments.append([0] * LedCommanderParser.CHANNELS_COUNT)
         self.static_scenes: List[Scene] = [Scene()] * self.STATIC_SCENES_COUNT
 
         with open(file, "rb") as readfile:
@@ -94,6 +96,9 @@ class LedCommanderParser:
                 error("ACME string missing! Abort")
                 return
 
+            self._read_mystery_dmx_info(readfile)
+            self._read_reserved_bytes(readfile)
+            self._read_random_bytes(readfile)
             self._read_virtual_dimmer_modes(readfile)
             self._read_virtual_dimmer_assignments(readfile)
             self._read_rest(readfile)
@@ -113,7 +118,7 @@ class LedCommanderParser:
         :param channel_id: channel to get name for
         :return: string of channel name
         """
-        if 0 <= channel_id < 12:
+        if 0 <= channel_id < self.CHANNELS_NAMES_COUNT:
             custom_name: str = self._name_to_str(self.channel_names[channel_id])
             default_name: str = self.default_channel_names[channel_id]
 
@@ -136,20 +141,6 @@ class LedCommanderParser:
         magic_number = readfile.read(512)
         return magic_number == b"succeeded" + (b"\x00" * 503)
 
-    @staticmethod
-    def _read_scene(readfile: BinaryIO) -> Scene:
-        """
-        Read block that contain information about scenes and chaser steps.
-
-        TODO: Parsing of block content is still missing, but according to manual,
-              it should contain 16 scenes and 2000 chaser steps
-
-        :param readfile: file to read bytes from.
-        :return read block
-        """
-        scene = Scene.parse_from(readfile)
-        return scene
-
     def _read_scenes(self, readfile: BinaryIO) -> None:
         """
         Read blocks that contain information about scenes and chaser steps.
@@ -161,14 +152,14 @@ class LedCommanderParser:
         :param readfile: file to read bytes from.
         """
         for static_scene_id in range(self.STATIC_SCENES_COUNT):
-            scene = self._read_scene(readfile)
+            scene = Scene.parse_from(readfile)
             if scene.is_set():
                 info(f"Scene {static_scene_id + 1}:")
                 scene.print()
             self.static_scenes[static_scene_id] = scene
 
         for block_id in range(self.CHASER_SCENES_COUNT):
-            self._read_scene(readfile)
+            Scene.parse_from(readfile)
 
     @staticmethod
     def _read_name(readfile: BinaryIO) -> bytes:
@@ -199,7 +190,7 @@ class LedCommanderParser:
 
         :param readfile: file to read bytes from.
         """
-        for channel_id in range(12):
+        for channel_id in range(self.CHANNELS_NAMES_COUNT):
             channel_name = self._read_name(readfile)
             self.channel_names[channel_id] = channel_name
             info(f"{self.default_channel_names[channel_id]} name: '{self._name_to_str(channel_name)}'")
@@ -223,7 +214,7 @@ class LedCommanderParser:
                 self.dmx_assignments[dmx_channel] = (None, 10)
                 info(f"DMX Channel {dmx_channel + 1}: {self._get_channel_name(10)}")
             else:
-                dmx_fixture, dmx_channel_of_fixture = divmod(dmx_channel_assignment, 10)
+                dmx_fixture, dmx_channel_of_fixture = divmod(dmx_channel_assignment, self.CHANNELS_COUNT)
                 self.dmx_assignments[dmx_channel] = (dmx_fixture, dmx_channel_of_fixture)
                 info(f"DMX Channel {dmx_channel + 1}: "
                      f"Fixture {dmx_fixture + 1}: "
@@ -231,7 +222,7 @@ class LedCommanderParser:
 
     def _read_mystery_fixture_info(self, readfile: BinaryIO) -> None:
         """
-        Read information about fixtures not known to mankind yet. Appears to be always \x00\x00\x05
+        Read information about fixtures not known to humanity yet. Appears to be always \x00\x00\x05
 
         Parses file offset 0x5AD54 - 0x5AD83
 
@@ -325,7 +316,7 @@ class LedCommanderParser:
         """
         for fixture_id in range(self.FIXTURES_COUNT):
             for channel_id in range(self.CHANNELS_COUNT):
-                self.virtual_dimmer_assignments[fixture_id][channel_id] = self._read_virtual_dimmer_mode(readfile)
+                self.virtual_dimmer_assignments[fixture_id][channel_id] = self._read_virtual_dimmer_assignment(readfile)
 
     @staticmethod
     def _read_rest(readfile: BinaryIO) -> bool:

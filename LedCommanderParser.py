@@ -8,18 +8,28 @@ from typing import BinaryIO, Tuple, List, Optional
 
 # File info so far
 # 0x00000 - 0x00009  "succeeded", magic number
-# 0x00200 - 0x0029F  Block of FF \  # first 16 blocks are scenes, rest will most likely be chaser steps
+# 0x00200 - 0x0029F  Block of FF \  # first 16 blocks are scenes, rest are chase steps
 # 0x002A0 - 0x002B7  Block of 00 /  Repeating until 0x5AAFF
 # 0x5AB00 - 0x5AB53  Names of Channels / Pan / Tilt / Aux
 # 0x5AB54 - 0x5AD53  DMX Channel assignment
-# 0x5AD54 - 0x5AD83  Block of 00 00 05
+# 0x5AD54 - 0x5AD83  Number of chase steps (16-bit) + 05 suffix
 # 0x5AD84 - 0x5AD88  "acme\00"
 # 0x5AD89 - 0x5AF88  Block of 02
-# 0x5AF89 - 0x6A988  Block of 00
+# 0x5AF89 - 0x6A988  Chase step assignment (16-bit)
 # 0x6A989 - 0x6A98C  Random stuff
 # 0x6A98D - 0x6A99C  Virtual Dimmer enabled (per fixture)
 # 0x6A99D - 0x6AA3C  Virtual Dimmer enabled (per fixture / channel)
 # 0x6AA3D - 0x801FF  Block of FF, probably not used
+
+
+class Chase:
+    def __init__(self):
+        self.step_ids: List[int] = [0] * LedCommanderParser.CHASE_STEP_COUNT
+        self.step_count: int = 0
+
+    def print(self):
+        info(f" Chase: {'->'.join('%d' % i for i in self.step_ids[0:self.step_count])}")
+        info(f" Number of steps: {self.step_count}")
 
 
 class Scene:
@@ -29,10 +39,13 @@ class Scene:
         for fixture_id in range(LedCommanderParser.FIXTURES_COUNT):
             self.fixture_channel_values.append([0] * LedCommanderParser.CHANNELS_COUNT)
             self.fixture_channel_active.append([False] * LedCommanderParser.CHANNELS_COUNT)
-        self.mystery_flags = b"" * 4
+        self.mystery_flags_1 = b"\x00" * 2
+        self.number_of_values = 0
+        self.mystery_flags_2 = b"\x00"
 
     def is_set(self):
-        return any(fixture != [255] * LedCommanderParser.CHANNELS_COUNT for fixture in self.fixture_channel_values)
+        # return any(fixture != [255] * LedCommanderParser.CHANNELS_COUNT for fixture in self.fixture_channel_values)
+        return any(any(fixture) for fixture in self.fixture_channel_active)
 
     def print(self):
         for fixture_id in range(LedCommanderParser.FIXTURES_COUNT):
@@ -41,7 +54,8 @@ class Scene:
                               for channel_id in range(LedCommanderParser.CHANNELS_COUNT))
             info(f" Fixture {fixture_id + 1:02d}: [{values}]")
 
-        info(f"Mystery: {self.mystery_flags.hex()}")
+        info(f"Number of values: {self.number_of_values}")
+        info(f"Mystery: {self.mystery_flags_1.hex()} {self.mystery_flags_2.hex()}")
 
     @classmethod
     def parse_from(cls, readfile: BinaryIO, *args, **kwargs) -> "Scene":
@@ -57,18 +71,21 @@ class Scene:
                 self.fixture_channel_active[fixture][channel] = value
                 index += 1
 
-        self.mystery_flags = readfile.read(4)  # Will likely contain chase information / flag for channels?
+        self.mystery_flags_1 = readfile.read(2)  # Always b"\x01\x00" ?
+        self.number_of_values = readfile.read(1)[0]
+        self.mystery_flags_2 = readfile.read(1)  # Always b"\x00" ? Is "number_of_values" 16-bit?
 
         return self
 
 
 class LedCommanderParser:
     FIXTURES_COUNT: int = 16
+    CHASES_COUNT: int = 16
     CHANNELS_COUNT: int = 10
     CHANNELS_NAMES_COUNT: int = 12
     DMX_CHANNELS_COUNT: int = 512
     STATIC_SCENES_COUNT: int = 16
-    CHASER_SCENES_COUNT: int = 2000
+    CHASE_STEP_COUNT: int = 2000
 
     def __init__(self, file):
         self.channel_names = [b"unknown"] * self.CHANNELS_NAMES_COUNT
@@ -79,6 +96,8 @@ class LedCommanderParser:
         for fixture_id in range(LedCommanderParser.FIXTURES_COUNT):
             self.virtual_dimmer_assignments.append([0] * LedCommanderParser.CHANNELS_COUNT)
         self.static_scenes: List[Scene] = [Scene()] * self.STATIC_SCENES_COUNT
+        self.chase_steps: List[Scene] = [Scene()] * self.CHASE_STEP_COUNT
+        self.chases: List[Chase] = [Chase()] * self.CHASES_COUNT
 
         with open(file, "rb") as readfile:
             self.is_magic_number_ok = self._read_and_check_magic_number(readfile)
@@ -90,14 +109,14 @@ class LedCommanderParser:
             self._read_scenes(readfile)
             self._read_names(readfile)
             self._read_dmx_channel_assignments(readfile)
-            self._read_mystery_fixture_info(readfile)
+            self._read_chase_info(readfile)
             self.is_magic_number_ok = self._read_acme_info(readfile)
             if not self.is_magic_number_ok:
                 error("ACME string missing! Abort")
                 return
 
             self._read_mystery_dmx_info(readfile)
-            self._read_reserved_bytes(readfile)
+            self._read_chase_step_assignments(readfile)
             self._read_random_bytes(readfile)
             self._read_virtual_dimmer_modes(readfile)
             self._read_virtual_dimmer_assignments(readfile)
@@ -143,10 +162,8 @@ class LedCommanderParser:
 
     def _read_scenes(self, readfile: BinaryIO) -> None:
         """
-        Read blocks that contain information about scenes and chaser steps.
+        Read blocks that contain information about scenes and chase steps.
 
-        TODO: Parsing of block content is still missing, but according to manual,
-              it should contain 16 scenes and 2000 chaser steps
         Parses file offset 0x00200 - 0x5AAFF
 
         :param readfile: file to read bytes from.
@@ -158,8 +175,12 @@ class LedCommanderParser:
                 scene.print()
             self.static_scenes[static_scene_id] = scene
 
-        for block_id in range(self.CHASER_SCENES_COUNT):
-            Scene.parse_from(readfile)
+        for block_id in range(self.CHASE_STEP_COUNT):
+            scene = Scene.parse_from(readfile)
+            if scene.is_set():
+                info(f"Chase step {block_id + 1}:")
+                scene.print()
+            self.chase_steps[block_id] = scene
 
     @staticmethod
     def _read_name(readfile: BinaryIO) -> bytes:
@@ -220,16 +241,25 @@ class LedCommanderParser:
                      f"Fixture {dmx_fixture + 1}: "
                      f"{self._get_channel_name(dmx_channel_of_fixture)}")
 
-    def _read_mystery_fixture_info(self, readfile: BinaryIO) -> None:
+    def _read_chase_info(self, readfile: BinaryIO) -> None:
         """
-        Read information about fixtures not known to humanity yet. Appears to be always \x00\x00\x05
+        Read information about chases that aren't clear yet. Appears to be {n}\x05
 
         Parses file offset 0x5AD54 - 0x5AD83
 
         :param readfile: file to read bytes from.
         """
-        for fixture_id in range(self.FIXTURES_COUNT):
-            readfile.read(3)
+        for chase_id in range(self.CHASES_COUNT):
+
+            number_of_steps_in_chase_raw = readfile.read(2)
+            number_of_steps_in_chase = number_of_steps_in_chase_raw[0] + number_of_steps_in_chase_raw[1] * 256
+            readfile.read(1)  # unknown, always b"\x05" ?
+
+            info(f"Chase {chase_id} has {number_of_steps_in_chase} steps")
+
+            chase = Chase()
+            chase.step_count = number_of_steps_in_chase
+            self.chases[chase_id] = chase
 
     @staticmethod
     def _read_acme_info(readfile: BinaryIO) -> bool:
@@ -253,16 +283,22 @@ class LedCommanderParser:
         for fixture_id in range(self.DMX_CHANNELS_COUNT):
             readfile.read(1)
 
-    @staticmethod
-    def _read_reserved_bytes(readfile: BinaryIO) -> None:
+    def _read_chase_step_assignments(self, readfile: BinaryIO) -> None:
         """
-        Read bytes that seem to stay \x00 and thus are hereby declared 'reserved'
+        Seem to be assignment of chase steps to scenes (?)
 
         Parses file offset 0x5AF89 - 0x6A988
 
         :param readfile: file to read bytes from.
         """
-        readfile.read(0xFA00)
+        for chase_id in range(self.CHASES_COUNT):
+            for step in range(self.CHASE_STEP_COUNT):
+                step_id = readfile.read(2)  # 16bit I guess
+                step_id = step_id[0] + step_id[1] * 256
+                self.chases[chase_id].step_ids[step] = step_id
+            if self.chases[chase_id].step_count > 0:
+                info(f"Chase {chase_id + 1}")
+                self.chases[chase_id].print()
 
     @staticmethod
     def _read_random_bytes(readfile: BinaryIO) -> None:
